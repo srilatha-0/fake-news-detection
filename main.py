@@ -1,132 +1,120 @@
-# fake_news_pipeline_fixed.py
+# distilbert_fake_news_subset.py
 
 import pandas as pd
-import re
-import nltk
-from nltk.corpus import stopwords
-from nltk.tokenize import word_tokenize
-from nltk.stem import WordNetLemmatizer
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-import joblib
+from transformers import DistilBertTokenizerFast, DistilBertForSequenceClassification, Trainer, TrainingArguments
+from datasets import Dataset
+import torch
 import streamlit as st
 import os
-from tqdm import tqdm  # For training progress
+from sklearn.utils import shuffle
 
 # -------------------------------
-# 1️⃣ NLTK Setup
+# 1️⃣ Load and Sample Dataset
 # -------------------------------
-def setup_nltk():
-    resources = ['punkt', 'punkt_tab', 'stopwords', 'wordnet']
-    for res in resources:
-        try:
-            if 'punkt' in res:
-                nltk.data.find(f'tokenizers/{res}')
-            else:
-                nltk.data.find(f'corpora/{res}')
-        except LookupError:
-            nltk.download(res)
-
-setup_nltk()
-
-# -------------------------------
-# 2️⃣ Text Preprocessing
-# -------------------------------
-def preprocess_text(text: str) -> str:
-    """Clean text: lowercase, remove punctuation, stopwords, lemmatize"""
-    text = text.lower()
-    text = re.sub(r'[^a-zA-Z]', ' ', text)
-    words = word_tokenize(text)
-    stop_words = set(stopwords.words('english'))
-    lemmatizer = WordNetLemmatizer()
-    words = [lemmatizer.lemmatize(word) for word in words if word not in stop_words]
-    return ' '.join(words)
-
-# -------------------------------
-# 3️⃣ Load Dataset
-# -------------------------------
-def load_dataset():
+def load_sampled_dataset(sample_size=5000):
+    # Load CSVs
     true_csv = pd.read_csv("datasets/True.csv")
     fake_csv = pd.read_csv("datasets/Fake.csv")
+    
     true_csv['label'] = 1
     fake_csv['label'] = 0
-    df = pd.concat([true_csv, fake_csv], axis=0).sample(frac=1).reset_index(drop=True)
-    tqdm.pandas(desc="Preprocessing Text")  # show progress bar
-    df['cleaned_text'] = df['title'].progress_apply(preprocess_text)
+    
+    # Shuffle and sample
+    true_sample = shuffle(true_csv).head(sample_size)
+    fake_sample = shuffle(fake_csv).head(sample_size)
+    
+    df = pd.concat([true_sample, fake_sample]).reset_index(drop=True)
+    df = shuffle(df).reset_index(drop=True)
     return df
 
 # -------------------------------
-# 4️⃣ Train Model
+# 2️⃣ Prepare Dataset for DistilBERT
 # -------------------------------
-def train_model(df):
-    X = df['cleaned_text']
-    y = df['label']
+def prepare_dataset(df):
+    dataset = Dataset.from_pandas(df[['title', 'label']])
+    tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
 
-    # TF-IDF with unigrams + bigrams
-    vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1,2))
-    X_vect = vectorizer.fit_transform(X).toarray()
-
-    # Split
-    X_train, X_test, y_train, y_test = train_test_split(X_vect, y, test_size=0.2, random_state=42)
-
-    # Logistic Regression with balanced class weight
-    model = LogisticRegression(class_weight='balanced', max_iter=500)
-    print("Training model...")
-    model.fit(X_train, y_train)
-    print("Training complete!")
-
-    # Evaluation
-    y_pred = model.predict(X_test)
-    print("\n✅ Model Evaluation:")
-    print("Accuracy:", accuracy_score(y_test, y_pred))
-    print("Classification Report:\n", classification_report(y_test, y_pred))
-    print("Confusion Matrix:\n", confusion_matrix(y_test, y_pred))
-
-    # Save
-    joblib.dump(model, 'fake_news_model.pkl')
-    joblib.dump(vectorizer, 'tfidf_vectorizer.pkl')
-    print("\n✅ Model and vectorizer saved to disk!")
-
-    return model, vectorizer
+    # Tokenize
+    def tokenize(batch):
+        return tokenizer(batch['title'], padding=True, truncation=True, max_length=128)
+    
+    dataset = dataset.map(tokenize, batched=True)
+    dataset = dataset.rename_column("label", "labels")
+    dataset.set_format('torch', columns=['input_ids', 'attention_mask', 'labels'])
+    
+    # Split train/test
+    train_test = dataset.train_test_split(test_size=0.2)
+    return train_test['train'], train_test['test'], tokenizer
 
 # -------------------------------
-# 5️⃣ Predict Function
+# 3️⃣ Train DistilBERT Model
 # -------------------------------
-def predict_news(model, vectorizer, text: str) -> str:
-    cleaned = preprocess_text(text)
-    vect_text = vectorizer.transform([cleaned])
-    if vect_text.sum() == 0:
-        return "⚠️ Input text has no words known to the model"
-    pred = model.predict(vect_text)[0]
+def train_model(train_dataset, eval_dataset):
+    model = DistilBertForSequenceClassification.from_pretrained(
+        'distilbert-base-uncased', num_labels=2
+    )
+
+    training_args = TrainingArguments(
+        output_dir='./results',
+        num_train_epochs=3,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        evaluation_strategy="steps",
+        save_steps=50,
+        logging_steps=10,
+        learning_rate=5e-5,
+        weight_decay=0.01,
+        logging_dir='./logs',
+        load_best_model_at_end=True
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset
+    )
+
+    trainer.train()
+    trainer.save_model('./models/distilbert_fake_news')
+    return model
+
+# -------------------------------
+# 4️⃣ Prediction Function
+# -------------------------------
+def predict_news(model, tokenizer, text):
+    inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=128)
+    outputs = model(**inputs)
+    pred = torch.argmax(outputs.logits).item()
     return "🟢 Real News" if pred == 1 else "🔴 Fake News"
 
 # -------------------------------
-# 6️⃣ Streamlit UI
+# 5️⃣ Streamlit UI
 # -------------------------------
 def run_streamlit():
-    # Load or train
-    if os.path.exists('fake_news_model.pkl') and os.path.exists('tfidf_vectorizer.pkl'):
-        model = joblib.load('fake_news_model.pkl')
-        vectorizer = joblib.load('tfidf_vectorizer.pkl')
-    else:
-        df = load_dataset()
-        model, vectorizer = train_model(df)
+    st.title("📰 Fake News Detector (DistilBERT - Subset Training)")
+    st.write("Enter a news headline to check if it's Real or Fake.")
 
-    st.title("📰 Fake News Detector (Fixed Pipeline)")
-    st.write("Enter a news headline or short article to check if it's Real or Fake.")
+    tokenizer = DistilBertTokenizerFast.from_pretrained('distilbert-base-uncased')
+    
+    # Load trained model or train on subset
+    if os.path.exists('./models/distilbert_fake_news'):
+        model = DistilBertForSequenceClassification.from_pretrained('./models/distilbert_fake_news')
+    else:
+        df = load_sampled_dataset(sample_size=5000)  # 5k True + 5k Fake
+        train_dataset, eval_dataset, tokenizer = prepare_dataset(df)
+        model = train_model(train_dataset, eval_dataset)
 
     user_input = st.text_area("📝 News Input")
     if st.button("🚀 Predict"):
         if user_input.strip() == "":
             st.warning("Please enter some news text!")
         else:
-            result = predict_news(model, vectorizer, user_input)
+            result = predict_news(model, tokenizer, user_input)
             st.success(result)
 
 # -------------------------------
-# 7️⃣ Main
+# 6️⃣ Main
 # -------------------------------
 if __name__ == "__main__":
     run_streamlit()
